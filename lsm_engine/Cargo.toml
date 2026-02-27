@@ -1,0 +1,33 @@
+[package]
+name = "lsm_engine"
+version = "0.1.0"
+edition = "2021"
+description = "LSM-tree storage engine for S3-backed PostgreSQL vector storage"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Object storage abstraction
+object_store = { version = "0.11", features = ["aws"] }
+
+# Data serialization
+bincode = "1"
+
+# Parking lot for better mutex performance
+parking_lot = "0.12"
+
+# Async stream utilities (for WAL segment listing)
+futures = "0.3"
+
+# Block-level compression
+zstd = "0.13"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

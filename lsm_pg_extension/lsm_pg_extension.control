@@ -1,0 +1,5 @@
+comment = 'LSM-Postgres: S3-native vector storage engine'
+default_version = '0.1.0'
+module_pathname = '$libdir/lsm_pg_extension'
+relocatable = false
+superuser = true

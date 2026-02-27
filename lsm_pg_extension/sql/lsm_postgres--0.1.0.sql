@@ -1,0 +1,26 @@
+-- LSM-Postgres Extension SQL Interface
+-- Version: 0.1.0
+--
+-- NOTE: This file is for reference only.
+-- All SQL definitions are managed by pgrx via extension_sql! macros
+-- in the Rust source code and auto-generated during build.
+--
+-- Registered access methods:
+--   lsm_s3    - Table AM  (CREATE TABLE ... USING lsm_s3)
+--   lsm_hnsw  - Index AM  (CREATE INDEX ... USING lsm_hnsw)
+--
+-- Operators:
+--   <->  L2 distance      (lsm_vector, lsm_vector) -> float4
+--   <=>  Cosine distance   (lsm_vector, lsm_vector) -> float4
+--   <#>  Neg inner product (lsm_vector, lsm_vector) -> float4
+--
+-- Operator class:
+--   lsm_vector_l2_ops DEFAULT FOR TYPE lsm_vector USING lsm_hnsw
+--     OPERATOR 1 <-> FOR ORDER BY float4_ops
+--     FUNCTION 1 lsm_vector_l2_distance
+--
+-- Usage:
+--   CREATE TABLE items (id TEXT, embedding lsm_vector) USING lsm_s3;
+--   INSERT INTO items VALUES ('doc:1', '[1.0, 2.0, 3.0]');
+--   CREATE INDEX ON items USING lsm_hnsw (embedding);
+--   SELECT * FROM items ORDER BY embedding <-> '[1,2,3]'::lsm_vector LIMIT 10;
