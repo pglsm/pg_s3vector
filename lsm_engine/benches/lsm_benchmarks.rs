@@ -77,7 +77,8 @@ fn bench_memtable_get(c: &mut Criterion) {
 
 fn bench_store_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("store_put");
-    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(100);
+    group.measurement_time(Duration::from_secs(120));
     let rt = runtime();
 
     for &count in &[100u64, 1_000, 10_000] {
@@ -273,7 +274,8 @@ fn bench_sstable_read(c: &mut Criterion) {
 
 fn bench_mixed_workload(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_workload");
-    group.measurement_time(Duration::from_secs(15));
+    group.sample_size(100);
+    group.measurement_time(Duration::from_secs(120));
     let rt = runtime();
 
     let ops = 5_000u64;

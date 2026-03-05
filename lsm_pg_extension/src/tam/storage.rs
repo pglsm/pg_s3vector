@@ -5,6 +5,7 @@
 //! tuple-level DML (DELETE, UPDATE) via Postgres's ItemPointer mechanism.
 
 use lsm_engine::{LsmConfig, LsmStore};
+use object_store::aws::AmazonS3Builder;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -140,6 +141,56 @@ impl TableStorage {
         mgr
     }
 
+    fn build_config(&self, table_name: &str) -> Result<LsmConfig, String> {
+        let endpoint = crate::LSM_S3_ENDPOINT
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or("memory");
+
+        let root_path = format!("/tables/{}", table_name);
+
+        if endpoint == "memory" {
+            let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
+            Ok(LsmConfig::in_memory(&root_path)
+                .with_memtable_size(memtable_mb * 1024 * 1024))
+        } else {
+            let bucket = crate::LSM_S3_BUCKET
+                .get()
+                .and_then(|c| c.to_str().ok())
+                .unwrap_or("lsm-postgres");
+            let region = crate::LSM_S3_REGION
+                .get()
+                .and_then(|c| c.to_str().ok())
+                .unwrap_or("us-east-1");
+            let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
+            let flush_ms = crate::LSM_S3_FLUSH_INTERVAL_MS.get() as u64;
+            let cache_mb = crate::LSM_S3_CACHE_SIZE_MB.get() as usize;
+
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .with_region(region)
+                .with_endpoint(endpoint)
+                .with_allow_http(endpoint.starts_with("http://"));
+
+            if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+                builder = builder.with_access_key_id(key);
+            }
+            if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+                builder = builder.with_secret_access_key(secret);
+            }
+
+            let object_store = Arc::new(
+                builder.build().map_err(|e| format!("Failed to build S3 client: {}", e))?
+            );
+
+            let mut config = LsmConfig::s3(&root_path, object_store);
+            config.memtable_size_limit = memtable_mb * 1024 * 1024;
+            config.flush_interval = std::time::Duration::from_millis(flush_ms);
+            config.block_cache_size = cache_mb * 1024 * 1024;
+            Ok(config)
+        }
+    }
+
     /// Get or create an LSM store for the given table.
     pub fn get_or_create(&self, table_name: &str) -> Result<Arc<LsmStore>, String> {
         {
@@ -149,8 +200,7 @@ impl TableStorage {
             }
         }
 
-        let config = LsmConfig::in_memory(&format!("/tables/{}", table_name))
-            .with_memtable_size(64 * 1024 * 1024);
+        let config = self.build_config(table_name)?;
 
         let store = self.runtime.block_on(async {
             LsmStore::open(config).await
