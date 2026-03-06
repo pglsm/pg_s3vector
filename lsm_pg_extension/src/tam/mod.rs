@@ -5,3 +5,4 @@ pub mod scan;
 pub mod storage;
 pub mod tam_handler;
 pub mod txn;
+pub mod wal;

@@ -16,7 +16,6 @@ use super::distance;
 use super::hnsw::{DistanceMetric, GraphSnapshot, HnswConfig, HnswIndex};
 use super::types::LsmVector;
 use super::vector_storage::LsmVectorStorage;
-use lsm_engine::LsmConfig;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -35,14 +34,12 @@ static HNSW_INDEXES: Lazy<RwLock<HashMap<pg_sys::Oid, IndexEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Create an LSM-backed vector store for a given index OID.
-fn make_vector_storage(oid: pg_sys::Oid) -> Arc<LsmVectorStorage> {
-    let rt = crate::tam::storage::TableStorage::global().runtime();
+fn make_vector_storage(oid: pg_sys::Oid) -> Result<Arc<LsmVectorStorage>, String> {
+    let storage = crate::tam::storage::TableStorage::global();
+    let rt = storage.runtime();
     let path = format!("/indexes/hnsw_{}/vectors", oid.as_u32());
-    let config = LsmConfig::in_memory(&path);
-    Arc::new(
-        LsmVectorStorage::new(config, rt)
-            .expect("Failed to create vector storage for HNSW index"),
-    )
+    let config = storage.build_config_for(&path)?;
+    Ok(Arc::new(LsmVectorStorage::new(config, rt)?))
 }
 
 fn save_index(oid: pg_sys::Oid) {
@@ -60,7 +57,7 @@ fn save_index(oid: pg_sys::Oid) {
 
         let storage = crate::tam::storage::TableStorage::global();
         let key = format!("__hnsw_graph_{}", oid.as_u32());
-        if let Err(e) = storage.insert("__hnsw_meta", key.as_bytes(), &json) {
+        if let Err(e) = storage.insert("__lsm_hnsw_meta", key.as_bytes(), &json) {
             tracing::warn!("Failed to persist HNSW index {}: {}", oid.as_u32(), e);
         }
     }
@@ -73,11 +70,17 @@ fn load_index(
     let storage_global = crate::tam::storage::TableStorage::global();
     let key = format!("__hnsw_graph_{}", oid.as_u32());
 
-    match storage_global.get("__hnsw_meta", key.as_bytes()) {
+    match storage_global.get("__lsm_hnsw_meta", key.as_bytes()) {
         Ok(Some(json)) => {
             match serde_json::from_slice::<GraphSnapshot>(&json) {
                 Ok(snapshot) => {
-                    let vs = make_vector_storage(oid);
+                    let vs = match make_vector_storage(oid) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("Failed to create vector storage for HNSW {}: {}", oid.as_u32(), e);
+                            return None;
+                        }
+                    };
                     let index = Arc::new(HnswIndex::restore(snapshot, vs));
                     HNSW_INDEXES.write().insert(oid, IndexEntry {
                         index: index.clone(),
@@ -112,7 +115,10 @@ fn get_or_create_index(
         metric,
         ..HnswConfig::default()
     };
-    let storage = make_vector_storage(oid);
+    let storage = match make_vector_storage(oid) {
+        Ok(s) => s,
+        Err(e) => pgrx::error!("Failed to create vector storage for HNSW index: {}", e),
+    };
     let index = Arc::new(HnswIndex::new(config, storage));
     HNSW_INDEXES.write().insert(oid, IndexEntry {
         index: index.clone(),

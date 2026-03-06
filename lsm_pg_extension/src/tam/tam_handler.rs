@@ -366,6 +366,8 @@ unsafe extern "C" fn lsm_tuple_insert(
     txn::ensure_xact_callback();
     match storage.insert_with_tid(&table_name, key.as_bytes(), &value_bytes) {
         Ok(tid_id) => {
+            super::wal::wal_log_insert(&table_name, key.as_bytes(), &value_bytes);
+            txn::mark_txn_has_wal();
             txn::record_insert(&table_name, tid_id);
             let (block, offset) = tid_to_block_offset(tid_id);
             pg_sys::ItemPointerSet(&mut (*slot).tts_tid, block, offset);
@@ -401,6 +403,8 @@ unsafe extern "C" fn lsm_tuple_delete(
 
     match storage.delete_by_tid(&table_name, tid_id) {
         Ok(Some(key_bytes)) => {
+            super::wal::wal_log_delete(&table_name, &key_bytes);
+            txn::mark_txn_has_wal();
             if let Some((_, old_val)) = old_kv {
                 txn::record_delete(&table_name, &key_bytes, &old_val, tid_id);
             }
@@ -439,14 +443,18 @@ unsafe extern "C" fn lsm_tuple_update(
     let old_offset = pg_sys::ItemPointerGetOffsetNumberNoCheck(otid);
     let old_tid_id = block_offset_to_tid(old_block, old_offset);
 
-    // Save old row for undo before deleting
-    let old_kv = storage.fetch_by_tid(&table_name, old_tid_id).unwrap_or(None);
+    let old_kv = match storage.fetch_by_tid(&table_name, old_tid_id) {
+        Ok(kv) => kv,
+        Err(e) => {
+            pgrx::warning!("LSM UPDATE fetch-old error: {}", e);
+            None
+        }
+    };
 
     match storage.delete_by_tid(&table_name, old_tid_id) {
-        Ok(Some(key_bytes)) => {
-            if let Some((_, old_val)) = old_kv {
-                txn::record_delete(&table_name, &key_bytes, &old_val, old_tid_id);
-            }
+        Ok(Some(ref deleted_key)) => {
+            super::wal::wal_log_delete(&table_name, deleted_key);
+            txn::mark_txn_has_wal();
         }
         Ok(None) => {}
         Err(e) => {
@@ -473,9 +481,15 @@ unsafe extern "C" fn lsm_tuple_update(
     let value_bytes = serialize_row(tts_values, tts_isnull, tupdesc, 1);
 
     match storage.insert_with_tid(&table_name, key.as_bytes(), &value_bytes) {
-        Ok(tid_id) => {
-            txn::record_insert(&table_name, tid_id);
-            let (block, offset) = tid_to_block_offset(tid_id);
+        Ok(new_tid_id) => {
+            super::wal::wal_log_insert(&table_name, key.as_bytes(), &value_bytes);
+            txn::mark_txn_has_wal();
+            if let Some((old_key, old_val)) = old_kv {
+                txn::record_update(&table_name, &old_key, &old_val, old_tid_id, new_tid_id);
+            } else {
+                txn::record_insert(&table_name, new_tid_id);
+            }
+            let (block, offset) = tid_to_block_offset(new_tid_id);
             pg_sys::ItemPointerSet(&mut (*slot).tts_tid, block, offset);
         }
         Err(e) => {
@@ -538,6 +552,8 @@ unsafe extern "C" fn lsm_relation_nontransactional_truncate(
     let storage = TableStorage::global();
     if let Err(e) = storage.truncate(&table_name) {
         pgrx::warning!("LSM TRUNCATE error: {}", e);
+    } else {
+        super::wal::wal_log_truncate(&table_name);
     }
 }
 

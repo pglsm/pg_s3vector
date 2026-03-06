@@ -193,11 +193,17 @@ impl SSTableBuilder {
 
         let mut out = BytesMut::new();
         if compressed {
-            let compressed_data = zstd::encode_all(&raw[..], 3)
-                .expect("zstd compression should not fail on in-memory data");
-            out.put_u8(1);
-            out.put_u32(raw.len() as u32);
-            out.put_slice(&compressed_data);
+            match zstd::encode_all(&raw[..], 3) {
+                Ok(compressed_data) => {
+                    out.put_u8(1);
+                    out.put_u32(raw.len() as u32);
+                    out.put_slice(&compressed_data);
+                }
+                Err(_) => {
+                    out.put_u8(0);
+                    out.put_slice(&raw);
+                }
+            }
         } else {
             out.put_u8(0);
             out.put_slice(&raw);

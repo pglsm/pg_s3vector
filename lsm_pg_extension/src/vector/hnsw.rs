@@ -280,12 +280,13 @@ impl<S: VectorStorage> HnswIndex<S> {
                         };
 
                         if needs_pruning {
-                            // Collect connection IDs for pruning
-                            let conn_ids = {
-                                let neighbor = nodes.get(&neighbor_id).unwrap();
-                                let mut ids = neighbor.connections[layer].clone();
-                                ids.push(id);
-                                ids
+                            let conn_ids = match nodes.get(&neighbor_id) {
+                                Some(neighbor) => {
+                                    let mut ids = neighbor.connections[layer].clone();
+                                    ids.push(id);
+                                    ids
+                                }
+                                None => continue,
                             };
 
                             // Load the neighbor's vector for distance computation
@@ -302,7 +303,7 @@ impl<S: VectorStorage> HnswIndex<S> {
                                     })
                                 })
                                 .collect();
-                            conn_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                            conn_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
                             let pruned: Vec<u64> = conn_dists
                                 .into_iter()
                                 .take(max_connections)

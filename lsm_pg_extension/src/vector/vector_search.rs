@@ -4,8 +4,8 @@
 //! with SQL functions for creating indexes, inserting vectors, and KNN search.
 
 use pgrx::prelude::*;
-use super::hnsw::{HnswConfig, HnswIndex};
-use super::vector_storage::InMemoryVectorStorage;
+use super::hnsw::{DistanceMetric, HnswConfig, HnswIndex};
+use super::vector_storage::LsmVectorStorage;
 use super::types::LsmVector;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -15,11 +15,8 @@ use std::sync::Arc;
 // Global Index Registry
 // ─────────────────────────────────────────────────────────────────────
 
-/// Global registry of HNSW indexes.
-///
-/// For the MVP, uses InMemoryVectorStorage. Future: LsmVectorStorage.
 struct IndexRegistry {
-    indexes: RwLock<HashMap<String, Arc<HnswIndex<InMemoryVectorStorage>>>>,
+    indexes: RwLock<HashMap<String, Arc<HnswIndex<LsmVectorStorage>>>>,
 }
 
 impl IndexRegistry {
@@ -35,7 +32,7 @@ impl IndexRegistry {
         &REGISTRY
     }
 
-    fn get(&self, name: &str) -> Option<Arc<HnswIndex<InMemoryVectorStorage>>> {
+    fn get(&self, name: &str) -> Option<Arc<HnswIndex<LsmVectorStorage>>> {
         self.indexes.read().get(name).cloned()
     }
 
@@ -43,15 +40,27 @@ impl IndexRegistry {
         &self,
         name: &str,
         config: HnswConfig,
-    ) -> Arc<HnswIndex<InMemoryVectorStorage>> {
+    ) -> Result<Arc<HnswIndex<LsmVectorStorage>>, String> {
         let mut indexes = self.indexes.write();
         if let Some(existing) = indexes.get(name) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
-        let storage = Arc::new(InMemoryVectorStorage::new());
+        let global_storage = crate::tam::storage::TableStorage::global();
+        let path = format!("/indexes/sql_{}/vectors", name);
+        let lsm_config = global_storage.build_config_for(&path)?;
+        let rt = global_storage.runtime();
+        let storage = Arc::new(LsmVectorStorage::new(lsm_config, rt)?);
         let index = Arc::new(HnswIndex::new(config, storage));
         indexes.insert(name.to_string(), index.clone());
-        index
+        Ok(index)
+    }
+}
+
+fn parse_metric(metric_str: &str) -> DistanceMetric {
+    match metric_str.to_lowercase().as_str() {
+        "cosine" | "cos" => DistanceMetric::Cosine,
+        "ip" | "inner_product" | "dot" => DistanceMetric::InnerProduct,
+        _ => DistanceMetric::L2,
     }
 }
 
@@ -66,32 +75,44 @@ impl IndexRegistry {
 /// - `m`: Max connections per node (default: 16)
 /// - `ef_construction`: Construction beam width (default: 200)
 /// - `ef_search`: Search beam width (default: 64)
+/// - `metric`: Distance metric: 'l2', 'cosine', or 'ip' (default: 'l2')
+/// - `max_layers`: Maximum graph layers (default: 16)
 ///
-/// Usage: `SELECT lsm_s3_create_vector_index('my_index', 16, 200, 64);`
+/// Usage: `SELECT lsm_s3_create_vector_index('my_index', 16, 200, 64, 'cosine', 24);`
 #[pg_extern]
 fn lsm_s3_create_vector_index(
     index_name: &str,
     m: default!(i32, 16),
     ef_construction: default!(i32, 200),
     ef_search: default!(i32, 64),
+    metric: default!(&str, "'l2'"),
+    max_layers: default!(i32, 16),
 ) -> String {
     let m = m.max(2) as usize;
+    let max_layers = max_layers.max(1) as usize;
     let config = HnswConfig {
         m,
         m_max_0: m * 2,
         ef_construction: ef_construction.max(1) as usize,
         ef_search: ef_search.max(1) as usize,
         ml: 1.0 / (m as f64).ln(),
-        max_layers: 16,
-        metric: super::hnsw::DistanceMetric::L2,
+        max_layers,
+        metric: parse_metric(metric),
     };
 
     let registry = IndexRegistry::global();
-    registry.create(index_name, config);
-    format!("CREATED INDEX {}", index_name)
+    match registry.create(index_name, config) {
+        Ok(_) => format!("CREATED INDEX {}", index_name),
+        Err(e) => {
+            pgrx::warning!("lsm_s3_create_vector_index error: {}", e);
+            format!("ERROR creating index {}: {}", index_name, e)
+        }
+    }
 }
 
 /// Insert a vector into an HNSW index with an associated key.
+///
+/// The index must already exist (created via `lsm_s3_create_vector_index`).
 ///
 /// Usage: `SELECT lsm_s3_index_insert('my_index', 'doc:42', '[1.0, 2.0, 3.0]'::lsm_vector);`
 #[pg_extern]
@@ -104,12 +125,16 @@ fn lsm_s3_index_insert(
     let index = match registry.get(index_name) {
         Some(idx) => idx,
         None => {
-            // Auto-create with defaults if not exists
-            registry.create(index_name, HnswConfig::default())
+            pgrx::warning!("Index '{}' not found. Create it first with lsm_s3_create_vector_index.", index_name);
+            return format!("ERROR: index '{}' not found", index_name);
         }
     };
 
     let id = index.insert_with_key(Some(key.to_string()), vector.data.clone());
+    unsafe {
+        crate::tam::wal::wal_log_vector_insert(index_name, key, &vector.data);
+        crate::tam::txn::mark_txn_has_wal();
+    }
     format!("INSERT {} (id={})", index_name, id)
 }
 
@@ -142,6 +167,32 @@ fn lsm_s3_vector_search(
     };
 
     TableIterator::new(results.into_iter().map(|(key, dist)| (key, dist)))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// WAL redo helpers — called from tam::wal during crash recovery
+// ─────────────────────────────────────────────────────────────────────
+
+/// Replay a vector insert during WAL redo.
+pub fn replay_index_insert(index_name: &str, key: &str, vector: &[f32]) -> Result<(), String> {
+    let registry = IndexRegistry::global();
+    let index = registry
+        .get(index_name)
+        .ok_or_else(|| format!("index '{}' not found during redo", index_name))?;
+    index.insert_with_key(Some(key.to_string()), vector.to_vec());
+    Ok(())
+}
+
+/// Replay a vector delete during WAL redo.
+pub fn replay_index_delete(index_name: &str, _key: &str) -> Result<(), String> {
+    let registry = IndexRegistry::global();
+    let _index = registry
+        .get(index_name)
+        .ok_or_else(|| format!("index '{}' not found during redo", index_name))?;
+    // HNSW does not currently support delete-by-key; the vector is
+    // effectively orphaned.  Full delete support requires an HNSW
+    // tombstone mechanism (future work).
+    Ok(())
 }
 
 /// Get information about a vector index.

@@ -49,8 +49,8 @@ fn lsm_postgres_version() -> &'static str {
 fn init_gucs() {
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.endpoint",
-        "S3 endpoint URL (or 'memory' for in-memory testing)",
-        "S3 endpoint URL",
+        "S3/GCS endpoint URL",
+        "Endpoint URL",
         &LSM_S3_ENDPOINT,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
@@ -58,8 +58,8 @@ fn init_gucs() {
 
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.bucket",
-        "S3 bucket name for data storage",
-        "S3 bucket name",
+        "Bucket name for data storage (S3 or GCS)",
+        "Bucket name",
         &LSM_S3_BUCKET,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
@@ -67,8 +67,8 @@ fn init_gucs() {
 
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.region",
-        "AWS region for S3",
-        "AWS region",
+        "Region (S3 only, ignored for GCS)",
+        "Region",
         &LSM_S3_REGION,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
@@ -153,6 +153,7 @@ fn lsm_s3_flush() -> String {
 #[pg_guard]
 pub extern "C" fn _PG_init() {
     init_gucs();
+    tam::wal::register_rmgr();
 }
 
 #[cfg(any(test, feature = "pg_test"))]

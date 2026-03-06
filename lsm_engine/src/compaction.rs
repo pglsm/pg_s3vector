@@ -170,7 +170,7 @@ impl Compactor {
         // Helper closure to read an SSTable and merge its entries
         let read_and_merge = |data: Bytes, merged: &mut BTreeMap<Vec<u8>, (u64, bool, Vec<u8>)>| -> LsmResult<()> {
             let reader = SSTableReader::open(data)?;
-            let entries = reader.scan_all_with_tombstones(&[], &[0xFF; 32])?;
+            let entries = reader.scan_all_with_tombstones(&[], &[0xFF; 128])?;
             for (key, seq, is_tombstone, value) in entries {
                 let should_insert = match merged.get(&key) {
                     Some((existing_seq, _, _)) => seq > *existing_seq,
@@ -282,7 +282,7 @@ impl Compactor {
 
             let reader = SSTableReader::open(data)?;
 
-            let entries = reader.scan_all_with_tombstones(&[], &[0xFF; 32])?;
+            let entries = reader.scan_all_with_tombstones(&[], &[0xFF; 128])?;
             for (key, seq, is_tombstone, value) in entries {
                 let should_insert = match merged.get(&key) {
                     Some((existing_seq, _, _)) => seq > *existing_seq,

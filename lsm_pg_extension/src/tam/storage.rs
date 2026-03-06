@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+const TID_STORE_PREFIX: &str = "__tid_";
+
 /// Global storage registry, accessible from any SQL function.
 static GLOBAL_STORAGE: Lazy<TableStorage> = Lazy::new(|| {
     TableStorage::new()
@@ -61,17 +63,17 @@ impl TidManager {
         }
     }
 
-    fn assign_or_get(&self, key: &[u8]) -> u64 {
+    fn assign_or_get(&self, key: &[u8]) -> (u64, bool) {
         {
             let map = self.key_to_tid.read();
             if let Some(&id) = map.get(key) {
-                return id;
+                return (id, false);
             }
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.tid_to_key.write().insert(id, key.to_vec());
         self.key_to_tid.write().insert(key.to_vec(), id);
-        id
+        (id, true)
     }
 
     fn key_for_tid(&self, id: u64) -> Option<Vec<u8>> {
@@ -106,8 +108,12 @@ pub struct TableStorage {
 
 impl TableStorage {
     fn new() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().min(8).max(2))
+            .unwrap_or(4);
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(workers)
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for LSM storage");
@@ -137,21 +143,86 @@ impl TableStorage {
             }
         }
         let mgr = Arc::new(TidManager::new());
+        self.rebuild_tid_manager(table_name, &mgr);
         self.tid_managers.write().insert(table_name.to_string(), mgr.clone());
         mgr
     }
 
-    fn build_config(&self, table_name: &str) -> Result<LsmConfig, String> {
+    fn tid_store_name(table_name: &str) -> String {
+        format!("{}{}", TID_STORE_PREFIX, table_name)
+    }
+
+    fn is_system_table(name: &str) -> bool {
+        name.starts_with(TID_STORE_PREFIX) || name.starts_with("__lsm_")
+    }
+
+    fn rebuild_tid_manager(&self, table_name: &str, mgr: &TidManager) {
+        if Self::is_system_table(table_name) {
+            return;
+        }
+        let tid_store = Self::tid_store_name(table_name);
+        if let Ok(entries) = self.scan_all(&tid_store) {
+            let mut max_id = 0u64;
+            for (key, value) in entries {
+                if value.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&value[..8]);
+                    let tid = u64::from_be_bytes(buf);
+                    if tid > 0 {
+                        mgr.restore(tid, &key);
+                        max_id = max_id.max(tid);
+                    }
+                }
+            }
+            if max_id > 0 {
+                mgr.next_id.store(max_id + 1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Low-level put that bypasses TID management. Used for internal
+    /// system tables (__tid_*, __lsm_hnsw_meta, etc.) to avoid recursion.
+    fn put_raw(&self, table_name: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let store = self.get_or_create(table_name)?;
+        self.runtime.block_on(async {
+            store.put(key, value).await
+        }).map_err(|e| format!("{}", e))
+    }
+
+    fn delete_raw(&self, table_name: &str, key: &[u8]) -> Result<(), String> {
+        let store = self.get_or_create(table_name)?;
+        self.runtime.block_on(async {
+            store.delete(key).await
+        }).map_err(|e| format!("{}", e))
+    }
+
+    fn persist_tid_assignment(&self, table_name: &str, tid: u64, key: &[u8]) {
+        let tid_store = Self::tid_store_name(table_name);
+        if let Err(e) = self.put_raw(&tid_store, key, &tid.to_be_bytes()) {
+            eprintln!("lsm_pg: failed to persist TID mapping for {}: {}", table_name, e);
+        }
+    }
+
+    fn remove_tid_persistence(&self, table_name: &str, key: &[u8]) {
+        let tid_store = Self::tid_store_name(table_name);
+        if let Err(e) = self.delete_raw(&tid_store, key) {
+            eprintln!("lsm_pg: failed to remove TID persistence for {}: {}", table_name, e);
+        }
+    }
+
+    /// Build an LSM config for an arbitrary storage path.
+    ///
+    /// Uses the configured GUCs for endpoint, bucket, region, etc.
+    /// Available for vector storage and index subsystems.
+    pub fn build_config_for(&self, root_path: &str) -> Result<LsmConfig, String> {
         let endpoint = crate::LSM_S3_ENDPOINT
             .get()
             .and_then(|c| c.to_str().ok())
             .unwrap_or("memory");
 
-        let root_path = format!("/tables/{}", table_name);
-
         if endpoint == "memory" {
             let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
-            Ok(LsmConfig::in_memory(&root_path)
+            Ok(LsmConfig::in_memory(root_path)
                 .with_memtable_size(memtable_mb * 1024 * 1024))
         } else {
             let bucket = crate::LSM_S3_BUCKET
@@ -179,16 +250,20 @@ impl TableStorage {
                 builder = builder.with_secret_access_key(secret);
             }
 
-            let object_store = Arc::new(
+            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
                 builder.build().map_err(|e| format!("Failed to build S3 client: {}", e))?
             );
 
-            let mut config = LsmConfig::s3(&root_path, object_store);
+            let mut config = LsmConfig::s3(root_path, object_store);
             config.memtable_size_limit = memtable_mb * 1024 * 1024;
             config.flush_interval = std::time::Duration::from_millis(flush_ms);
             config.block_cache_size = cache_mb * 1024 * 1024;
             Ok(config)
         }
+    }
+
+    fn build_config(&self, table_name: &str) -> Result<LsmConfig, String> {
+        self.build_config_for(&format!("/tables/{}", table_name))
     }
 
     /// Get or create an LSM store for the given table.
@@ -221,7 +296,11 @@ impl TableStorage {
         }).map_err(|e| format!("{}", e))?;
 
         let mgr = self.tid_manager(table_name);
-        Ok(mgr.assign_or_get(key))
+        let (tid, is_new) = mgr.assign_or_get(key);
+        if is_new && !Self::is_system_table(table_name) {
+            self.persist_tid_assignment(table_name, tid, key);
+        }
+        Ok(tid)
     }
 
     /// Insert a key-value pair into a table.
@@ -260,6 +339,9 @@ impl TableStorage {
         }).map_err(|e| format!("{}", e))?;
 
         mgr.remove(tid_id);
+        if !Self::is_system_table(table_name) {
+            self.remove_tid_persistence(table_name, &key);
+        }
         Ok(Some(key))
     }
 
@@ -285,40 +367,52 @@ impl TableStorage {
     /// Get the TID id for a key (or assign one).
     pub fn tid_for_key(&self, table_name: &str, key: &[u8]) -> u64 {
         let mgr = self.tid_manager(table_name);
-        mgr.assign_or_get(key)
+        let (tid, is_new) = mgr.assign_or_get(key);
+        if is_new && !Self::is_system_table(table_name) {
+            self.persist_tid_assignment(table_name, tid, key);
+        }
+        tid
     }
 
     /// Scan all entries in a table. Returns (key, value, tid_id) triples.
     pub fn scan_all_with_tids(&self, table_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>, u64)>, String> {
         let store = self.get_or_create(table_name)?;
         let entries = self.runtime.block_on(async {
-            store.scan(&[], &[0xFF; 32]).await
+            store.scan(&[], &[0xFF; 128]).await
         }).map_err(|e| format!("{}", e))?;
 
         let mgr = self.tid_manager(table_name);
+        let persist = !Self::is_system_table(table_name);
         Ok(entries
             .into_iter()
             .map(|e| {
-                let offset = mgr.assign_or_get(&e.key);
-                (e.key, e.value, offset)
+                let (tid, is_new) = mgr.assign_or_get(&e.key);
+                if is_new && persist {
+                    self.persist_tid_assignment(table_name, tid, &e.key);
+                }
+                (e.key, e.value, tid)
             })
             .collect())
     }
 
     /// Scan all keys (without values) in a table. Returns (key, tid_id) pairs.
-    /// Used by sequential scan to reduce peak memory — values are fetched on demand.
+    /// Used by sequential scan to reduce peak memory -- values are fetched on demand.
     pub fn scan_keys_with_tids(&self, table_name: &str) -> Result<Vec<(Vec<u8>, u64)>, String> {
         let store = self.get_or_create(table_name)?;
         let entries = self.runtime.block_on(async {
-            store.scan(&[], &[0xFF; 32]).await
+            store.scan(&[], &[0xFF; 128]).await
         }).map_err(|e| format!("{}", e))?;
 
         let mgr = self.tid_manager(table_name);
+        let persist = !Self::is_system_table(table_name);
         Ok(entries
             .into_iter()
             .map(|e| {
-                let offset = mgr.assign_or_get(&e.key);
-                (e.key, offset)
+                let (tid, is_new) = mgr.assign_or_get(&e.key);
+                if is_new && persist {
+                    self.persist_tid_assignment(table_name, tid, &e.key);
+                }
+                (e.key, tid)
             })
             .collect())
     }
@@ -327,7 +421,7 @@ impl TableStorage {
     pub fn scan_all(&self, table_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         let store = self.get_or_create(table_name)?;
         let entries = self.runtime.block_on(async {
-            store.scan(&[], &[0xFF; 32]).await
+            store.scan(&[], &[0xFF; 128]).await
         }).map_err(|e| format!("{}", e))?;
 
         Ok(entries.into_iter().map(|e| (e.key, e.value)).collect())
@@ -362,18 +456,28 @@ impl TableStorage {
         }).map_err(|e| format!("{}", e))
     }
 
-    /// Flush all tables. Returns the number of tables flushed.
+    /// Flush all tables in parallel. Returns the number of user tables flushed.
     pub fn flush_all(&self) -> Result<usize, String> {
         let stores: Vec<(String, Arc<LsmStore>)> = {
             let map = self.stores.read();
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
-        let count = stores.len();
-        for (name, store) in &stores {
-            self.runtime.block_on(async {
-                store.flush().await
-            }).map_err(|e| format!("Flush failed for '{}': {}", name, e))?;
-        }
+        let count = stores.iter().filter(|(k, _)| !Self::is_system_table(k)).count();
+        self.runtime.block_on(async {
+            let futs: Vec<_> = stores.iter().map(|(name, store)| {
+                let name = name.clone();
+                let store = store.clone();
+                async move {
+                    store.flush().await
+                        .map_err(|e| format!("Flush failed for '{}': {}", name, e))
+                }
+            }).collect();
+            let results = futures::future::join_all(futs).await;
+            for r in results {
+                r?;
+            }
+            Ok::<(), String>(())
+        })?;
         Ok(count)
     }
 
@@ -385,13 +489,12 @@ impl TableStorage {
 
     /// Truncate a table: delete all data and reset TID mapping.
     pub fn truncate(&self, table_name: &str) -> Result<(), String> {
-        // Remove the existing store
         self.stores.write().remove(table_name);
-        // Reset TID mapping
         if let Some(mgr) = self.tid_managers.read().get(table_name) {
             mgr.clear();
         }
-        // Re-create an empty store
+        let tid_store = Self::tid_store_name(table_name);
+        self.stores.write().remove(&tid_store);
         self.get_or_create(table_name)?;
         Ok(())
     }
