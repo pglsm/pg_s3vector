@@ -58,6 +58,35 @@ static LSM_S3_MEMTABLE_SIZE_MB: pgrx::GucSetting<i32> =
 static LSM_S3_CACHE_SIZE_MB: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(256);
 
+/// L0 compaction threshold (number of L0 SSTables before triggering compaction).
+static LSM_S3_COMPACTION_THRESHOLD: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(4);
+
+/// SSTable target size in MB.
+static LSM_S3_SSTABLE_TARGET_SIZE_MB: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(64);
+
+/// SSTable block size in KB.
+static LSM_S3_BLOCK_SIZE_KB: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(4);
+
+/// Enable zstd compression for SSTables.
+static LSM_S3_COMPRESSION: pgrx::GucSetting<bool> =
+    pgrx::GucSetting::<bool>::new(true);
+
+/// Enable LSM engine WAL on S3 (disable when PG WAL handles durability).
+static LSM_S3_WAL_ENABLED: pgrx::GucSetting<bool> =
+    pgrx::GucSetting::<bool>::new(false);
+
+/// LRU cache size for hot vectors in MB (reduces S3 reads during HNSW traversal).
+static LSM_S3_VECTOR_CACHE_MB: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(256);
+
+/// Return configured vector cache size in bytes.
+pub fn vector_cache_bytes() -> usize {
+    (LSM_S3_VECTOR_CACHE_MB.get().max(0) as usize) * 1024 * 1024
+}
+
 #[pg_extern]
 fn lsm_postgres_version() -> &'static str {
     "0.1.0"
@@ -162,6 +191,68 @@ fn init_gucs() {
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
     );
+
+    pgrx::GucRegistry::define_int_guc(
+        "lsm_s3.compaction_threshold",
+        "Number of L0 SSTables before triggering compaction",
+        "Compaction threshold",
+        &LSM_S3_COMPACTION_THRESHOLD,
+        1,
+        100,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        "lsm_s3.sstable_target_size_mb",
+        "Target size for SSTable files in MB",
+        "SSTable size",
+        &LSM_S3_SSTABLE_TARGET_SIZE_MB,
+        1,
+        1024,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        "lsm_s3.block_size_kb",
+        "Block size within SSTables in KB",
+        "Block size",
+        &LSM_S3_BLOCK_SIZE_KB,
+        1,
+        256,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_bool_guc(
+        "lsm_s3.compression",
+        "Enable zstd compression for SSTables",
+        "Compression",
+        &LSM_S3_COMPRESSION,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_bool_guc(
+        "lsm_s3.wal_enabled",
+        "Enable LSM engine WAL on S3 (disable when PG WAL handles durability)",
+        "LSM WAL",
+        &LSM_S3_WAL_ENABLED,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        "lsm_s3.vector_cache_mb",
+        "LRU cache for hot vectors in MB (reduces S3 reads during HNSW traversal)",
+        "Vector cache",
+        &LSM_S3_VECTOR_CACHE_MB,
+        0,
+        65536,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -197,7 +288,7 @@ fn lsm_s3_status() -> String {
     };
 
     format!(
-        "LSM-Postgres v{}\nProvider: {}\nEndpoint: {}\nBucket: {}\nCredentials: {}\nFlush Interval: {}ms\nMemTable Limit: {}MB\nCache Size: {}MB",
+        "LSM-Postgres v{}\nProvider: {}\nEndpoint: {}\nBucket: {}\nCredentials: {}\nFlush Interval: {}ms\nMemTable Limit: {}MB\nBlock Cache: {}MB\nVector Cache: {}MB",
         lsm_postgres_version(),
         provider,
         endpoint,
@@ -206,6 +297,7 @@ fn lsm_s3_status() -> String {
         LSM_S3_FLUSH_INTERVAL_MS.get(),
         LSM_S3_MEMTABLE_SIZE_MB.get(),
         LSM_S3_CACHE_SIZE_MB.get(),
+        LSM_S3_VECTOR_CACHE_MB.get(),
     )
 }
 

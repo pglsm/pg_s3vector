@@ -281,10 +281,21 @@ impl TableStorage {
             _ => self.build_s3_store(endpoint, bucket, &creds_file, &guc_key, &guc_secret)?,
         };
 
+        let compaction_threshold = crate::LSM_S3_COMPACTION_THRESHOLD.get() as usize;
+        let sstable_target_mb = crate::LSM_S3_SSTABLE_TARGET_SIZE_MB.get() as usize;
+        let block_size_kb = crate::LSM_S3_BLOCK_SIZE_KB.get() as usize;
+        let compression = crate::LSM_S3_COMPRESSION.get();
+        let wal_enabled = crate::LSM_S3_WAL_ENABLED.get();
+
         let mut config = LsmConfig::s3(root_path, object_store);
         config.memtable_size_limit = memtable_mb * 1024 * 1024;
         config.flush_interval = std::time::Duration::from_millis(flush_ms);
         config.block_cache_size = cache_mb * 1024 * 1024;
+        config.l0_compaction_threshold = compaction_threshold;
+        config.sstable_target_size = sstable_target_mb * 1024 * 1024;
+        config.block_size = block_size_kb * 1024;
+        config.enable_compression = compression;
+        config.wal_enabled = wal_enabled;
         Ok(config)
     }
 

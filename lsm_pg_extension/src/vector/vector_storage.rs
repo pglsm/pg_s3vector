@@ -6,9 +6,108 @@
 
 use lsm_engine::{LsmConfig, LsmStore};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+
+// ─────────────────────────────────────────────────────────────────────
+// LRU Vector Cache
+// ─────────────────────────────────────────────────────────────────────
+
+struct VectorCache {
+    inner: RwLock<VectorCacheInner>,
+    capacity_bytes: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+struct VectorCacheInner {
+    map: HashMap<u64, Vec<f32>>,
+    order: VecDeque<u64>,
+    current_bytes: usize,
+}
+
+impl VectorCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            inner: RwLock::new(VectorCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                current_bytes: 0,
+            }),
+            capacity_bytes,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<Vec<f32>> {
+        let mut inner = self.inner.write();
+        if let Some(vec) = inner.map.get(&id).cloned() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            promote_id(&mut inner.order, id);
+            Some(vec)
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn insert(&self, id: u64, vector: &[f32]) {
+        let entry_bytes = vector.len() * 4 + 32; // f32 data + overhead
+        if entry_bytes > self.capacity_bytes {
+            return;
+        }
+
+        let mut inner = self.inner.write();
+
+        if let Some(old) = inner.map.get(&id) {
+            inner.current_bytes -= old.len() * 4 + 32;
+            promote_id(&mut inner.order, id);
+        } else {
+            inner.order.push_front(id);
+        }
+
+        while inner.current_bytes + entry_bytes > self.capacity_bytes {
+            if let Some(victim) = inner.order.pop_back() {
+                if let Some(evicted) = inner.map.remove(&victim) {
+                    inner.current_bytes -= evicted.len() * 4 + 32;
+                }
+            } else {
+                break;
+            }
+        }
+
+        inner.current_bytes += entry_bytes;
+        inner.map.insert(id, vector.to_vec());
+    }
+
+    fn remove(&self, id: u64) {
+        let mut inner = self.inner.write();
+        if let Some(vec) = inner.map.remove(&id) {
+            inner.current_bytes -= vec.len() * 4 + 32;
+            if let Some(pos) = inner.order.iter().position(|&k| k == id) {
+                inner.order.remove(pos);
+            }
+        }
+    }
+
+    fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+}
+
+fn promote_id(order: &mut VecDeque<u64>, id: u64) {
+    if let Some(pos) = order.iter().position(|&k| k == id) {
+        order.remove(pos);
+    }
+    order.push_front(id);
+}
 
 /// Trait for storing and retrieving vectors by node ID.
 ///
@@ -92,20 +191,32 @@ impl VectorStorage for InMemoryVectorStorage {
 // LSM Engine Backend (production — S3-backed)
 // ─────────────────────────────────────────────────────────────────────
 
+/// Default vector cache size: 256 MB.
+const DEFAULT_VECTOR_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Stores vectors in the LSM engine, persisted to S3.
 ///
-/// Vectors are stored as raw f32 byte arrays with keys like `v:{id}`.
-/// Uses a dedicated LsmStore separate from user table data.
+/// An LRU cache sits in front of the LSM store so that hot vectors
+/// (e.g. frequently-visited HNSW neighbours) are served from RAM
+/// without any `block_on` / object-store overhead.
 pub struct LsmVectorStorage {
     store: Arc<LsmStore>,
     runtime: Arc<Runtime>,
+    cache: Arc<VectorCache>,
 }
 
 impl LsmVectorStorage {
-    /// Create a new LSM-backed vector storage.
-    ///
-    /// Opens (or creates) an LsmStore at the given path within object storage.
+    /// Create a new LSM-backed vector storage with default cache size.
     pub fn new(config: LsmConfig, runtime: Arc<Runtime>) -> Result<Self, String> {
+        Self::with_cache(config, runtime, DEFAULT_VECTOR_CACHE_BYTES)
+    }
+
+    /// Create a new LSM-backed vector storage with explicit cache capacity.
+    pub fn with_cache(
+        config: LsmConfig,
+        runtime: Arc<Runtime>,
+        cache_bytes: usize,
+    ) -> Result<Self, String> {
         let store = runtime
             .block_on(async { LsmStore::open(config).await })
             .map_err(|e| format!("Failed to open vector store: {}", e))?;
@@ -113,7 +224,13 @@ impl LsmVectorStorage {
         Ok(Self {
             store: Arc::new(store),
             runtime,
+            cache: Arc::new(VectorCache::new(cache_bytes)),
         })
+    }
+
+    /// Cache hit / miss stats for diagnostics.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (self.cache.hits(), self.cache.misses())
     }
 
     /// Flush the underlying LSM store's MemTable to object storage.
@@ -171,45 +288,76 @@ impl VectorStorage for LsmVectorStorage {
         let value = Self::encode_vector(vector);
         self.runtime
             .block_on(async { self.store.put(&key, &value).await })
-            .map_err(|e| format!("Vector store error: {}", e))
+            .map_err(|e| format!("Vector store error: {}", e))?;
+
+        self.cache.insert(id, vector);
+        Ok(())
     }
 
     fn load(&self, id: u64) -> Result<Vec<f32>, String> {
+        if let Some(vec) = self.cache.get(id) {
+            return Ok(vec);
+        }
+
         let key = Self::key(id);
         let bytes = self
             .runtime
             .block_on(async { self.store.get(&key).await })
             .map_err(|e| format!("Vector load error: {}", e))?
             .ok_or_else(|| format!("Vector {} not found", id))?;
-        Self::decode_vector(&bytes)
+        let vec = Self::decode_vector(&bytes)?;
+
+        self.cache.insert(id, &vec);
+        Ok(vec)
     }
 
     fn batch_load(&self, ids: &[u64]) -> Result<Vec<(u64, Vec<f32>)>, String> {
-        let store = self.store.clone();
-        let ids = ids.to_vec();
+        let mut results = Vec::with_capacity(ids.len());
+        let mut miss_ids = Vec::new();
 
-        self.runtime.block_on(async {
-            let futs: Vec<_> = ids.iter().map(|&id| {
-                let store = store.clone();
-                async move {
-                    let key = LsmVectorStorage::key(id);
-                    match store.get(&key).await {
-                        Ok(Some(bytes)) => LsmVectorStorage::decode_vector(&bytes)
-                            .ok()
-                            .map(|vec| (id, vec)),
-                        _ => None,
+        for &id in ids {
+            if let Some(vec) = self.cache.get(id) {
+                results.push((id, vec));
+            } else {
+                miss_ids.push(id);
+            }
+        }
+
+        if !miss_ids.is_empty() {
+            let store = self.store.clone();
+            let cache = self.cache.clone();
+
+            let fetched: Vec<(u64, Vec<f32>)> = self.runtime.block_on(async {
+                let futs: Vec<_> = miss_ids.iter().map(|&id| {
+                    let store = store.clone();
+                    async move {
+                        let key = LsmVectorStorage::key(id);
+                        match store.get(&key).await {
+                            Ok(Some(bytes)) => LsmVectorStorage::decode_vector(&bytes)
+                                .ok()
+                                .map(|vec| (id, vec)),
+                            _ => None,
+                        }
                     }
-                }
-            }).collect();
+                }).collect();
 
-            Ok(futures::future::join_all(futs).await
-                .into_iter()
-                .flatten()
-                .collect())
-        })
+                futures::future::join_all(futs).await
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            });
+
+            for (id, vec) in &fetched {
+                cache.insert(*id, vec);
+            }
+            results.extend(fetched);
+        }
+
+        Ok(results)
     }
 
     fn delete(&self, id: u64) -> Result<(), String> {
+        self.cache.remove(id);
         let key = Self::key(id);
         self.runtime
             .block_on(async { self.store.delete(&key).await })
@@ -347,5 +495,71 @@ mod tests {
     fn test_decode_invalid_length() {
         let bad_bytes = vec![1, 2, 3]; // Not a multiple of 4
         assert!(LsmVectorStorage::decode_vector(&bad_bytes).is_err());
+    }
+
+    // ── Vector Cache tests ──
+
+    #[test]
+    fn test_lsm_cache_hit_on_reload() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let config = LsmConfig::in_memory("/test_cache_hit");
+        let storage = LsmVectorStorage::with_cache(config, rt, 1024 * 1024).unwrap();
+
+        let vec = vec![1.0, 2.0, 3.0];
+        storage.store(1, &vec).unwrap();
+
+        let (hits_before, _) = storage.cache_stats();
+        let loaded = storage.load(1).unwrap();
+        assert_eq!(loaded, vec);
+        let (hits_after, _) = storage.cache_stats();
+        assert_eq!(hits_after, hits_before + 1, "Second load should hit cache");
+    }
+
+    #[test]
+    fn test_lsm_cache_eviction() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let config = LsmConfig::in_memory("/test_cache_evict");
+        // Tiny cache: only ~1 vector fits (3 f32s = 12 bytes + 32 overhead = 44 bytes)
+        let storage = LsmVectorStorage::with_cache(config, rt, 80).unwrap();
+
+        storage.store(1, &[1.0, 2.0, 3.0]).unwrap();
+        storage.store(2, &[4.0, 5.0, 6.0]).unwrap();
+
+        // Vector 1 should have been evicted (cache only holds one)
+        let loaded2 = storage.load(2).unwrap();
+        assert_eq!(loaded2, vec![4.0, 5.0, 6.0]);
+        let (hits, _) = storage.cache_stats();
+        assert!(hits >= 1, "Load of vector 2 should hit cache");
+
+        // Vector 1 must fall through to LSM store
+        let loaded1 = storage.load(1).unwrap();
+        assert_eq!(loaded1, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_lsm_cache_invalidate_on_delete() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let config = LsmConfig::in_memory("/test_cache_delete");
+        let storage = LsmVectorStorage::with_cache(config, rt, 1024 * 1024).unwrap();
+
+        storage.store(1, &[1.0]).unwrap();
+        let _ = storage.load(1).unwrap(); // populate cache
+        storage.delete(1).unwrap();
+        assert!(storage.load(1).is_err(), "Deleted vector should not be in cache");
     }
 }

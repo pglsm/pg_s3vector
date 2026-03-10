@@ -61,7 +61,8 @@ impl IndexRegistry {
         let path = format!("/indexes/sql_{}/vectors", name);
         let lsm_config = global_storage.build_config_for(&path)?;
         let rt = global_storage.runtime();
-        let storage = Arc::new(LsmVectorStorage::new(lsm_config, rt)?);
+        let cache_bytes = crate::vector_cache_bytes();
+        let storage = Arc::new(LsmVectorStorage::with_cache(lsm_config, rt, cache_bytes)?);
         let index = Arc::new(HnswIndex::new(config, storage));
         indexes.insert(name.to_string(), index.clone());
         Ok(index)
@@ -214,7 +215,7 @@ pub fn flush_all_vector_indexes() -> Result<usize, String> {
     IndexRegistry::global().flush_all()
 }
 
-/// Get information about a vector index.
+/// Get information about a vector index including cache stats.
 ///
 /// Usage: `SELECT lsm_s3_vector_index_info('my_index');`
 #[pg_extern]
@@ -223,10 +224,20 @@ fn lsm_s3_vector_index_info(index_name: &str) -> String {
 
     match registry.get(index_name) {
         Some(index) => {
+            let (hits, misses) = index.storage_ref().cache_stats();
+            let total = hits + misses;
+            let hit_rate = if total > 0 {
+                (hits as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
             format!(
-                "Index '{}': {} vectors",
+                "Index '{}': {} vectors, cache: {}/{} hits ({:.1}%)",
                 index_name,
-                index.len()
+                index.len(),
+                hits,
+                total,
+                hit_rate,
             )
         }
         None => format!("Index '{}' not found", index_name),

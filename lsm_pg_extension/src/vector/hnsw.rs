@@ -289,19 +289,15 @@ impl<S: VectorStorage> HnswIndex<S> {
                                 None => continue,
                             };
 
-                            // Load the neighbor's vector for distance computation
                             let query_vec = match self.storage.load(neighbor_id) {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
 
-                            let mut conn_dists: Vec<(u64, f32)> = conn_ids
+                            let loaded = self.storage.batch_load(&conn_ids).unwrap_or_default();
+                            let mut conn_dists: Vec<(u64, f32)> = loaded
                                 .iter()
-                                .filter_map(|&cid| {
-                                    self.storage.load(cid).ok().map(|v| {
-                                        (cid, self.compute_distance(&query_vec, &v))
-                                    })
-                                })
+                                .map(|(cid, v)| (*cid, self.compute_distance(&query_vec, v)))
                                 .collect();
                             conn_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
                             let pruned: Vec<u64> = conn_dists
@@ -310,7 +306,6 @@ impl<S: VectorStorage> HnswIndex<S> {
                                 .map(|(cid, _)| cid)
                                 .collect();
 
-                            // Apply pruned connections
                             if let Some(neighbor) = nodes.get_mut(&neighbor_id) {
                                 if layer < neighbor.connections.len() {
                                     neighbor.connections[layer] = pruned;
@@ -381,6 +376,7 @@ impl<S: VectorStorage> HnswIndex<S> {
     }
 
     /// Search a single layer, returning the single nearest node.
+    /// Batch-loads all neighbor vectors per iteration to minimise block_on overhead.
     fn search_layer_single(&self, query: &[f32], entry: u64, layer: usize) -> u64 {
         let nodes = self.nodes.read();
         let mut current = entry;
@@ -390,20 +386,26 @@ impl<S: VectorStorage> HnswIndex<S> {
             .unwrap_or(f32::MAX);
 
         loop {
-            let mut changed = false;
+            let neighbor_ids: Vec<u64> = match nodes.get(&current) {
+                Some(node) if layer < node.connections.len() => {
+                    node.connections[layer].clone()
+                }
+                _ => break,
+            };
 
-            if let Some(node) = nodes.get(&current) {
-                if layer < node.connections.len() {
-                    for &neighbor_id in &node.connections[layer] {
-                        if let Ok(neighbor_vec) = self.storage.load(neighbor_id) {
-                            let dist = self.compute_distance(query, &neighbor_vec);
-                            if dist < current_dist {
-                                current = neighbor_id;
-                                current_dist = dist;
-                                changed = true;
-                            }
-                        }
-                    }
+            if neighbor_ids.is_empty() {
+                break;
+            }
+
+            let vecs = self.storage.batch_load(&neighbor_ids).unwrap_or_default();
+
+            let mut changed = false;
+            for (id, vec) in vecs {
+                let dist = self.compute_distance(query, &vec);
+                if dist < current_dist {
+                    current = id;
+                    current_dist = dist;
+                    changed = true;
                 }
             }
 
@@ -416,6 +418,8 @@ impl<S: VectorStorage> HnswIndex<S> {
     }
 
     /// Search a layer using a beam search with ef candidates.
+    /// Batch-loads all unvisited neighbor vectors per candidate to minimise
+    /// block_on overhead when vectors live on object storage.
     fn search_layer(
         &self,
         query: &[f32],
@@ -425,8 +429,8 @@ impl<S: VectorStorage> HnswIndex<S> {
     ) -> Vec<Candidate> {
         let nodes = self.nodes.read();
         let mut visited = HashSet::new();
-        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new(); // min-heap
-        let mut result: BinaryHeap<MaxCandidate> = BinaryHeap::new(); // max-heap
+        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
+        let mut result: BinaryHeap<MaxCandidate> = BinaryHeap::new();
 
         let entry_dist = self.storage
             .load(entry)
@@ -444,33 +448,38 @@ impl<S: VectorStorage> HnswIndex<S> {
                 break;
             }
 
-            if let Some(node) = nodes.get(&id) {
-                if layer < node.connections.len() {
-                    for &neighbor_id in &node.connections[layer] {
-                        if visited.contains(&neighbor_id) {
-                            continue;
-                        }
-                        visited.insert(neighbor_id);
+            let unvisited: Vec<u64> = match nodes.get(&id) {
+                Some(node) if layer < node.connections.len() => {
+                    node.connections[layer]
+                        .iter()
+                        .copied()
+                        .filter(|nid| !visited.contains(nid))
+                        .collect()
+                }
+                _ => continue,
+            };
 
-                        if let Ok(neighbor_vec) = self.storage.load(neighbor_id) {
-                            let dist = self.compute_distance(query, &neighbor_vec);
-                            let worst = result.peek().map(|r| r.distance).unwrap_or(f32::MAX);
+            for &nid in &unvisited {
+                visited.insert(nid);
+            }
 
-                            if dist < worst || result.len() < ef {
-                                candidates.push(Candidate { id: neighbor_id, distance: dist });
-                                result.push(MaxCandidate { id: neighbor_id, distance: dist });
+            let loaded = self.storage.batch_load(&unvisited).unwrap_or_default();
 
-                                if result.len() > ef {
-                                    result.pop(); // Remove worst
-                                }
-                            }
-                        }
+            for (neighbor_id, neighbor_vec) in loaded {
+                let dist = self.compute_distance(query, &neighbor_vec);
+                let worst = result.peek().map(|r| r.distance).unwrap_or(f32::MAX);
+
+                if dist < worst || result.len() < ef {
+                    candidates.push(Candidate { id: neighbor_id, distance: dist });
+                    result.push(MaxCandidate { id: neighbor_id, distance: dist });
+
+                    if result.len() > ef {
+                        result.pop();
                     }
                 }
             }
         }
 
-        // Convert result to sorted candidates
         let mut sorted: Vec<Candidate> = result
             .into_iter()
             .map(|mc| Candidate { id: mc.id, distance: mc.distance })
