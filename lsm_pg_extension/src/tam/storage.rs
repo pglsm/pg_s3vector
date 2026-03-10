@@ -6,6 +6,7 @@
 
 use lsm_engine::{LsmConfig, LsmStore};
 use object_store::aws::AmazonS3Builder;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -97,6 +98,23 @@ impl TidManager {
         self.tid_to_key.write().insert(id, key.to_vec());
         self.key_to_tid.write().insert(key.to_vec(), id);
     }
+}
+
+/// Read S3 credentials from a JSON file: {"access_key_id":"...","secret_access_key":"..."}
+fn read_s3_credentials_file(path: &str) -> Result<(String, String), String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read credentials file '{}': {}", path, e))?;
+    let v: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid JSON in credentials file '{}': {}", path, e))?;
+    let key = v["access_key_id"]
+        .as_str()
+        .ok_or_else(|| format!("Missing 'access_key_id' in {}", path))?
+        .to_string();
+    let secret = v["secret_access_key"]
+        .as_str()
+        .ok_or_else(|| format!("Missing 'secret_access_key' in {}", path))?
+        .to_string();
+    Ok((key, secret))
 }
 
 /// Registry of per-table LSM stores.
@@ -212,8 +230,15 @@ impl TableStorage {
 
     /// Build an LSM config for an arbitrary storage path.
     ///
-    /// Uses the configured GUCs for endpoint, bucket, region, etc.
-    /// Available for vector storage and index subsystems.
+    /// Provider resolution:
+    ///   lsm_s3.provider = 's3'  → AmazonS3Builder (AWS, MinIO, Akave, GCS-HMAC)
+    ///   lsm_s3.provider = 'gcs' → GoogleCloudStorageBuilder (native GCS auth)
+    ///
+    /// Credential resolution (both providers):
+    ///   1. lsm_s3.credentials_file  (JSON on disk, chmod 600)
+    ///   2. lsm_s3.access_key_id + secret_access_key GUCs
+    ///   3. Environment variables (AWS_* or GOOGLE_APPLICATION_CREDENTIALS)
+    ///   4. SDK auto-discovery (IAM role / GCE metadata / ADC)
     pub fn build_config_for(&self, root_path: &str) -> Result<LsmConfig, String> {
         let endpoint = crate::LSM_S3_ENDPOINT
             .get()
@@ -222,44 +247,106 @@ impl TableStorage {
 
         if endpoint == "memory" {
             let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
-            Ok(LsmConfig::in_memory(root_path)
-                .with_memtable_size(memtable_mb * 1024 * 1024))
-        } else {
-            let bucket = crate::LSM_S3_BUCKET
-                .get()
-                .and_then(|c| c.to_str().ok())
-                .unwrap_or("lsm-postgres");
-            let region = crate::LSM_S3_REGION
-                .get()
-                .and_then(|c| c.to_str().ok())
-                .unwrap_or("us-east-1");
-            let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
-            let flush_ms = crate::LSM_S3_FLUSH_INTERVAL_MS.get() as u64;
-            let cache_mb = crate::LSM_S3_CACHE_SIZE_MB.get() as usize;
-
-            let mut builder = AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .with_region(region)
-                .with_endpoint(endpoint)
-                .with_allow_http(endpoint.starts_with("http://"));
-
-            if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
-                builder = builder.with_access_key_id(key);
-            }
-            if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
-                builder = builder.with_secret_access_key(secret);
-            }
-
-            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
-                builder.build().map_err(|e| format!("Failed to build S3 client: {}", e))?
-            );
-
-            let mut config = LsmConfig::s3(root_path, object_store);
-            config.memtable_size_limit = memtable_mb * 1024 * 1024;
-            config.flush_interval = std::time::Duration::from_millis(flush_ms);
-            config.block_cache_size = cache_mb * 1024 * 1024;
-            Ok(config)
+            return Ok(LsmConfig::in_memory(root_path)
+                .with_memtable_size(memtable_mb * 1024 * 1024));
         }
+
+        let provider = crate::LSM_S3_PROVIDER
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or("s3");
+        let bucket = crate::LSM_S3_BUCKET
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or("lsm-postgres");
+        let memtable_mb = crate::LSM_S3_MEMTABLE_SIZE_MB.get() as usize;
+        let flush_ms = crate::LSM_S3_FLUSH_INTERVAL_MS.get() as u64;
+        let cache_mb = crate::LSM_S3_CACHE_SIZE_MB.get() as usize;
+
+        let creds_file = crate::LSM_S3_CREDENTIALS_FILE
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .map(|s| s.to_string());
+        let guc_key = crate::LSM_S3_ACCESS_KEY_ID
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .map(|s| s.to_string());
+        let guc_secret = crate::LSM_S3_SECRET_ACCESS_KEY
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .map(|s| s.to_string());
+
+        let object_store: Arc<dyn object_store::ObjectStore> = match provider {
+            "gcs" => self.build_gcs_store(bucket, &creds_file)?,
+            _ => self.build_s3_store(endpoint, bucket, &creds_file, &guc_key, &guc_secret)?,
+        };
+
+        let mut config = LsmConfig::s3(root_path, object_store);
+        config.memtable_size_limit = memtable_mb * 1024 * 1024;
+        config.flush_interval = std::time::Duration::from_millis(flush_ms);
+        config.block_cache_size = cache_mb * 1024 * 1024;
+        Ok(config)
+    }
+
+    /// Build an S3-compatible ObjectStore (AWS, MinIO, Akave, GCS-HMAC).
+    ///
+    /// Credential chain: credentials_file → GUC keys → env vars → SDK auto (IAM role).
+    fn build_s3_store(
+        &self,
+        endpoint: &str,
+        bucket: &str,
+        creds_file: &Option<String>,
+        guc_key: &Option<String>,
+        guc_secret: &Option<String>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+        let region = crate::LSM_S3_REGION
+            .get()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or("us-east-1");
+
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_endpoint(endpoint)
+            .with_allow_http(endpoint.starts_with("http://"));
+
+        if let Some(path) = creds_file {
+            let (key, secret) = read_s3_credentials_file(path)?;
+            builder = builder.with_access_key_id(key).with_secret_access_key(secret);
+        } else if let (Some(key), Some(secret)) = (guc_key, guc_secret) {
+            builder = builder.with_access_key_id(key).with_secret_access_key(secret);
+        } else if let (Ok(key), Ok(secret)) = (
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) {
+            builder = builder.with_access_key_id(key).with_secret_access_key(secret);
+        }
+        // else: no explicit creds — SDK will try IMDS / IAM instance profile
+
+        Ok(Arc::new(
+            builder.build().map_err(|e| format!("S3 client error: {}", e))?,
+        ))
+    }
+
+    /// Build a native GCS ObjectStore.
+    ///
+    /// Credential chain: credentials_file → GOOGLE_APPLICATION_CREDENTIALS → GCE metadata / ADC.
+    fn build_gcs_store(
+        &self,
+        bucket: &str,
+        creds_file: &Option<String>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+        let mut builder = GoogleCloudStorageBuilder::new()
+            .with_bucket_name(bucket);
+
+        if let Some(path) = creds_file {
+            builder = builder.with_service_account_path(path);
+        }
+        // else: builder auto-discovers via GOOGLE_APPLICATION_CREDENTIALS env → metadata service
+
+        Ok(Arc::new(
+            builder.build().map_err(|e| format!("GCS client error: {}", e))?,
+        ))
     }
 
     fn build_config(&self, table_name: &str) -> Result<LsmConfig, String> {

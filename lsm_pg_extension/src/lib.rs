@@ -16,17 +16,35 @@ pgrx::pg_module_magic!();
 // GUC (Grand Unified Configuration) Variables
 // ─────────────────────────────────────────────────────────────────────
 
-/// S3 endpoint URL (or "memory" for in-memory testing).
+/// Storage provider: 's3' (AWS/MinIO/Akave/GCS-HMAC) or 'gcs' (native GCS auth).
+static LSM_S3_PROVIDER: pgrx::GucSetting<Option<&'static CStr>> =
+    pgrx::GucSetting::<Option<&'static CStr>>::new(Some(c"s3"));
+
+/// S3-compatible endpoint URL (or "memory" for in-memory testing).
 static LSM_S3_ENDPOINT: pgrx::GucSetting<Option<&'static CStr>> =
     pgrx::GucSetting::<Option<&'static CStr>>::new(Some(c"memory"));
 
-/// S3 bucket name.
+/// Bucket name for data storage.
 static LSM_S3_BUCKET: pgrx::GucSetting<Option<&'static CStr>> =
     pgrx::GucSetting::<Option<&'static CStr>>::new(Some(c"lsm-postgres"));
 
-/// S3 region.
+/// S3 region (ignored for native GCS).
 static LSM_S3_REGION: pgrx::GucSetting<Option<&'static CStr>> =
     pgrx::GucSetting::<Option<&'static CStr>>::new(Some(c"us-east-1"));
+
+/// Path to a JSON credentials file.
+/// S3: {"access_key_id":"...","secret_access_key":"..."}
+/// GCS: standard Google service-account key file.
+static LSM_S3_CREDENTIALS_FILE: pgrx::GucSetting<Option<&'static CStr>> =
+    pgrx::GucSetting::<Option<&'static CStr>>::new(None);
+
+/// S3 access key ID (prefer credentials_file for production).
+static LSM_S3_ACCESS_KEY_ID: pgrx::GucSetting<Option<&'static CStr>> =
+    pgrx::GucSetting::<Option<&'static CStr>>::new(None);
+
+/// S3 secret access key (prefer credentials_file for production).
+static LSM_S3_SECRET_ACCESS_KEY: pgrx::GucSetting<Option<&'static CStr>> =
+    pgrx::GucSetting::<Option<&'static CStr>>::new(None);
 
 /// Flush interval in milliseconds.
 static LSM_S3_FLUSH_INTERVAL_MS: pgrx::GucSetting<i32> =
@@ -47,9 +65,20 @@ fn lsm_postgres_version() -> &'static str {
 
 /// Initialize GUC variables when the extension loads.
 fn init_gucs() {
+    let secret_flags = pgrx::GucFlags::SUPERUSER_ONLY | pgrx::GucFlags::NO_SHOW_ALL;
+
+    pgrx::GucRegistry::define_string_guc(
+        "lsm_s3.provider",
+        "Storage provider: 's3' (AWS/MinIO/Akave/GCS-HMAC) or 'gcs' (native GCS auth)",
+        "Provider",
+        &LSM_S3_PROVIDER,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.endpoint",
-        "S3/GCS endpoint URL",
+        "S3-compatible endpoint URL (or 'memory' for in-memory testing)",
         "Endpoint URL",
         &LSM_S3_ENDPOINT,
         pgrx::GucContext::Suset,
@@ -58,7 +87,7 @@ fn init_gucs() {
 
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.bucket",
-        "Bucket name for data storage (S3 or GCS)",
+        "Bucket name for data storage",
         "Bucket name",
         &LSM_S3_BUCKET,
         pgrx::GucContext::Suset,
@@ -67,11 +96,38 @@ fn init_gucs() {
 
     pgrx::GucRegistry::define_string_guc(
         "lsm_s3.region",
-        "Region (S3 only, ignored for GCS)",
+        "Region (S3 provider only, ignored for native GCS)",
         "Region",
         &LSM_S3_REGION,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        "lsm_s3.credentials_file",
+        "Path to JSON credentials file (chmod 600 recommended)",
+        "Credentials file",
+        &LSM_S3_CREDENTIALS_FILE,
+        pgrx::GucContext::Suset,
+        secret_flags,
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        "lsm_s3.access_key_id",
+        "S3 access key ID (prefer credentials_file for production)",
+        "Access key",
+        &LSM_S3_ACCESS_KEY_ID,
+        pgrx::GucContext::Suset,
+        secret_flags,
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        "lsm_s3.secret_access_key",
+        "S3 secret access key (prefer credentials_file for production)",
+        "Secret key",
+        &LSM_S3_SECRET_ACCESS_KEY,
+        pgrx::GucContext::Suset,
+        secret_flags,
     );
 
     pgrx::GucRegistry::define_int_guc(
@@ -115,20 +171,38 @@ fn init_gucs() {
 /// Get the current status of the LSM store.
 #[pg_extern]
 fn lsm_s3_status() -> String {
+    let provider = LSM_S3_PROVIDER
+        .get()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("s3");
     let endpoint = LSM_S3_ENDPOINT
         .get()
-        .map(|c| c.to_str().unwrap_or("invalid"))
+        .and_then(|c| c.to_str().ok())
         .unwrap_or("not set");
     let bucket = LSM_S3_BUCKET
         .get()
-        .map(|c| c.to_str().unwrap_or("invalid"))
+        .and_then(|c| c.to_str().ok())
         .unwrap_or("not set");
 
+    let cred_source = if LSM_S3_CREDENTIALS_FILE.get().is_some() {
+        "credentials_file"
+    } else if LSM_S3_ACCESS_KEY_ID.get().is_some() {
+        "guc (access_key_id)"
+    } else if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
+        "env (AWS_ACCESS_KEY_ID)"
+    } else if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok() {
+        "env (GOOGLE_APPLICATION_CREDENTIALS)"
+    } else {
+        "auto (IAM / metadata / ADC)"
+    };
+
     format!(
-        "LSM-Postgres v{}\nEndpoint: {}\nBucket: {}\nFlush Interval: {}ms\nMemTable Limit: {}MB\nCache Size: {}MB",
+        "LSM-Postgres v{}\nProvider: {}\nEndpoint: {}\nBucket: {}\nCredentials: {}\nFlush Interval: {}ms\nMemTable Limit: {}MB\nCache Size: {}MB",
         lsm_postgres_version(),
+        provider,
         endpoint,
         bucket,
+        cred_source,
         LSM_S3_FLUSH_INTERVAL_MS.get(),
         LSM_S3_MEMTABLE_SIZE_MB.get(),
         LSM_S3_CACHE_SIZE_MB.get(),
