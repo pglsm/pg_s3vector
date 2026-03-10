@@ -209,14 +209,19 @@ fn lsm_s3_status() -> String {
     )
 }
 
-/// Force a flush of all in-memory MemTables to S3.
+/// Force a flush of all in-memory MemTables to S3 (tables + vector indexes).
 #[pg_extern]
 fn lsm_s3_flush() -> String {
     let storage = tam::storage::TableStorage::global();
-    match storage.flush_all() {
-        Ok(count) => format!("Flushed {} table(s)", count),
-        Err(e) => format!("ERROR: {}", e),
-    }
+    let table_count = match storage.flush_all() {
+        Ok(c) => c,
+        Err(e) => return format!("ERROR flushing tables: {}", e),
+    };
+    let index_count = match vector::vector_search::flush_all_vector_indexes() {
+        Ok(c) => c,
+        Err(e) => return format!("Flushed {} table(s), ERROR flushing indexes: {}", table_count, e),
+    };
+    format!("Flushed {} table(s), {} vector index(es)", table_count, index_count)
 }
 
 // ─────────────────────────────────────────────────────────────────────

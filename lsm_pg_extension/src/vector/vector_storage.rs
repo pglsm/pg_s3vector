@@ -116,6 +116,13 @@ impl LsmVectorStorage {
         })
     }
 
+    /// Flush the underlying LSM store's MemTable to object storage.
+    pub fn flush(&self) -> Result<(), String> {
+        self.runtime
+            .block_on(async { self.store.flush().await })
+            .map_err(|e| format!("Vector store flush error: {}", e))
+    }
+
     /// Encode a vector ID as a storage key.
     fn key(id: u64) -> Vec<u8> {
         let mut k = Vec::with_capacity(2 + 8);

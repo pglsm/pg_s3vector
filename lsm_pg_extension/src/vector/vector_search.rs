@@ -36,6 +36,18 @@ impl IndexRegistry {
         self.indexes.read().get(name).cloned()
     }
 
+    fn flush_all(&self) -> Result<usize, String> {
+        let indexes = self.indexes.read();
+        let mut count = 0;
+        for (name, index) in indexes.iter() {
+            index.storage_ref().flush().map_err(|e| {
+                format!("Flush failed for vector index '{}': {}", name, e)
+            })?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn create(
         &self,
         name: &str,
@@ -193,6 +205,13 @@ pub fn replay_index_delete(index_name: &str, _key: &str) -> Result<(), String> {
     // effectively orphaned.  Full delete support requires an HNSW
     // tombstone mechanism (future work).
     Ok(())
+}
+
+/// Flush all vector index stores to object storage.
+///
+/// Returns the number of indexes flushed.
+pub fn flush_all_vector_indexes() -> Result<usize, String> {
+    IndexRegistry::global().flush_all()
 }
 
 /// Get information about a vector index.
